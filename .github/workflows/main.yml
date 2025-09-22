@@ -18,7 +18,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12'  # Updated to latest stable version
+        python-version: '3.12'
         
     - name: Cache pip dependencies
       uses: actions/cache@v4
@@ -27,6 +27,14 @@ jobs:
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements-minimal.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
+          
+    - name: Restore ETL state
+      uses: actions/cache@v4
+      with:
+        path: etl_state.json
+        key: etl-state-${{ github.repository }}
+        restore-keys: |
+          etl-state-
           
     - name: Install dependencies
       run: |
@@ -60,11 +68,20 @@ jobs:
       run: |
         rm -f service_account.json
         
-    - name: Upload logs on failure
+    - name: Save ETL state
+      if: success()
+      uses: actions/cache/save@v4
+      with:
+        path: etl_state.json
+        key: etl-state-${{ github.repository }}-${{ github.run_number }}
+        
+    - name: Upload logs and state on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: etl-logs-${{ github.run_number }}
-        path: weather_etl.log
+        name: etl-debug-${{ github.run_number }}
+        path: |
+          weather_etl.log
+          etl_state.json
         retention-days: 7
         if-no-files-found: warn
