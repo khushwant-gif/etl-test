@@ -36,7 +36,7 @@ if not API_KEY:
 LAT, LON = 28.61, 77.23  # Example: Delhi, change to your location
 
 API_URL = (
-    f"https://api.openweathermap.org/data/3.0/onecall"
+    f"https://api.openweathermap.org/data/2.5/onecall"
     f"?lat={LAT}&lon={LON}&exclude=minutely,daily,alerts,current"
     f"&appid={API_KEY}&units=metric"
 )
