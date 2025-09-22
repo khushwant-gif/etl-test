@@ -20,7 +20,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json",
 client = gspread.authorize(creds)
 print("✅ Connected to Google Sheets")
 
-sheet_name = "WeatherData"
+sheet_name = "Weather_Data"
 try:
     sheet = client.open(sheet_name).sheet1
 except Exception as e:
