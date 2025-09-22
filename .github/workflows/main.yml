@@ -2,8 +2,8 @@ name: Weather ETL to Google Sheets
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # every 30 minutes
-  workflow_dispatch:
+    - cron: '0 0,12 * * *'  # Runs at 00:00 UTC and 12:00 UTC every day
+  workflow_dispatch:        # Manual trigger if needed
 
 jobs:
   run-etl:
