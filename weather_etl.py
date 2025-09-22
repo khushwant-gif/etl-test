@@ -2,9 +2,10 @@ import os
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import time
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +27,54 @@ class WeatherETL:
         self.LON = lon
         self.client = None
         self.sheet = None
+        self.state_file = "etl_state.json"
+        
+    def load_state(self):
+        """Load the last run state from file"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    logger.info(f"📁 Loaded state: {state}")
+                    return state
+        except Exception as e:
+            logger.warning(f"⚠️ Error loading state file: {e}")
+        
+        # Default state for first run
+        return {
+            "last_run": None,
+            "first_run": True
+        }
+    
+    def save_state(self, state):
+        """Save the current run state to file"""
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f)
+            logger.info(f"💾 Saved state: {state}")
+        except Exception as e:
+            logger.error(f"❌ Error saving state: {e}")
+    
+    def get_existing_timestamps(self):
+        """Get existing timestamps from Google Sheets to avoid duplicates"""
+        try:
+            # Get all values from the sheet
+            all_values = self.sheet.get_all_values()
+            
+            if not all_values:
+                return set()
+            
+            # Find the Time column (assuming it's the first column)
+            timestamps = set()
+            for row in all_values[1:]:  # Skip header row
+                if row and row[0]:  # Check if time column has data
+                    timestamps.add(row[0])
+            
+            logger.info(f"📋 Found {len(timestamps)} existing timestamps")
+            return timestamps
+        except Exception as e:
+            logger.error(f"❌ Error getting existing timestamps: {e}")
+            return set()
         
     def setup_google_sheets(self):
         """Initialize Google Sheets connection"""
@@ -45,17 +94,31 @@ class WeatherETL:
             logger.error(f"❌ Error connecting to Google Sheets: {e}")
             return False
     
-    def fetch_weather_data(self):
+    def fetch_weather_data(self, start_date=None, end_date=None, forecast_days=1):
         """Fetch weather data from Open-Meteo API"""
         API_URL = "https://api.open-meteo.com/v1/forecast"
+        
         params = {
             "latitude": self.LAT,
             "longitude": self.LON,
             "hourly": ["temperature_2m", "relative_humidity_2m", 
                       "visibility", "weathercode", "precipitation"],
-            "timezone": "Asia/Kolkata",
-            "forecast_days": 1  # Limit to today's data
+            "timezone": "Asia/Kolkata"
         }
+        
+        # For historical data (past week on first run)
+        if start_date and end_date:
+            # Use historical weather API for past data
+            API_URL = "https://archive-api.open-meteo.com/v1/era5"
+            params.update({
+                "start_date": start_date,
+                "end_date": end_date
+            })
+            logger.info(f"📅 Fetching historical data from {start_date} to {end_date}")
+        else:
+            # For current/forecast data
+            params["forecast_days"] = forecast_days
+            logger.info(f"🔮 Fetching forecast data for {forecast_days} days")
         
         max_retries = 3
         for attempt in range(max_retries):
@@ -73,8 +136,8 @@ class WeatherETL:
                     logger.error(f"❌ Failed to fetch weather data after {max_retries} attempts")
                     return None
     
-    def prepare_data(self, data):
-        """Transform weather data into list of rows"""
+    def prepare_data(self, data, existing_timestamps=None):
+        """Transform weather data into list of rows, filtering duplicates"""
         try:
             hourly = data["hourly"]
             
@@ -93,14 +156,23 @@ class WeatherETL:
             # Prepare rows
             rows = []
             fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing_timestamps = existing_timestamps or set()
             
             # Get the minimum length to avoid index errors
             min_length = min(len(arr) for arr in [times, temperatures, humidity, 
                            visibility, weather_codes, precipitation] if arr)
             
+            duplicate_count = 0
             for i in range(min_length):
+                timestamp = times[i] if i < len(times) else ''
+                
+                # Skip if this timestamp already exists
+                if timestamp in existing_timestamps:
+                    duplicate_count += 1
+                    continue
+                
                 row = [
-                    times[i] if i < len(times) else '',
+                    timestamp,
                     temperatures[i] if i < len(temperatures) else '',
                     humidity[i] if i < len(humidity) else '',
                     visibility[i] if i < len(visibility) else '',
@@ -110,7 +182,7 @@ class WeatherETL:
                 ]
                 rows.append(row)
             
-            logger.info(f"📊 Prepared {len(rows)} rows of data")
+            logger.info(f"📊 Prepared {len(rows)} new rows ({duplicate_count} duplicates skipped)")
             return rows
         except Exception as e:
             logger.error(f"❌ Error preparing data: {e}")
@@ -119,6 +191,10 @@ class WeatherETL:
     def upload_to_sheets(self, rows):
         """Upload data rows to Google Sheets"""
         try:
+            if not rows:
+                logger.info("📋 No new data to upload")
+                return True
+            
             # Define headers
             headers = [
                 "Time", "Temperature_2m", "Humidity_2m", 
@@ -139,6 +215,10 @@ class WeatherETL:
                 self.sheet.append_rows(batch)
                 total_uploaded += len(batch)
                 logger.info(f"📤 Uploaded batch: {len(batch)} rows")
+                
+                # Small delay to avoid rate limits
+                if i + batch_size < len(rows):
+                    time.sleep(1)
             
             logger.info(f"✅ Successfully uploaded {total_uploaded} rows to Google Sheets")
             return True
@@ -146,35 +226,97 @@ class WeatherETL:
             logger.error(f"❌ Error uploading to Google Sheets: {e}")
             return False
     
+    def run_initial_load(self):
+        """Run initial load with past week's data"""
+        logger.info("🔄 Running initial load - fetching past week's data...")
+        
+        # Calculate date range for past week
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=7)
+        
+        # Fetch historical data
+        weather_data = self.fetch_weather_data(
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d")
+        )
+        
+        if not weather_data:
+            logger.error("❌ Failed to fetch initial historical data")
+            return False
+        
+        # Get existing timestamps to avoid duplicates
+        existing_timestamps = self.get_existing_timestamps()
+        
+        # Prepare data
+        rows = self.prepare_data(weather_data, existing_timestamps)
+        if not rows:
+            logger.info("📋 No new historical data to upload")
+            return True
+        
+        # Upload to sheets
+        return self.upload_to_sheets(rows)
+    
+    def run_incremental_update(self):
+        """Run incremental update with recent data"""
+        logger.info("🔄 Running incremental update...")
+        
+        # Fetch current forecast data (next 1-2 days)
+        weather_data = self.fetch_weather_data(forecast_days=2)
+        
+        if not weather_data:
+            logger.error("❌ Failed to fetch incremental data")
+            return False
+        
+        # Get existing timestamps to avoid duplicates
+        existing_timestamps = self.get_existing_timestamps()
+        
+        # Prepare data
+        rows = self.prepare_data(weather_data, existing_timestamps)
+        
+        # Upload to sheets
+        return self.upload_to_sheets(rows)
+    
     def run(self):
         """Execute the complete ETL process"""
         logger.info("🚀 Starting Weather ETL process...")
+        
+        # Load previous state
+        state = self.load_state()
         
         # Setup Google Sheets connection
         if not self.setup_google_sheets():
             return False
         
-        # Fetch weather data
-        weather_data = self.fetch_weather_data()
-        if not weather_data:
-            return False
+        # Determine run type
+        success = False
+        if state.get("first_run", True):
+            # First run - load past week's data
+            success = self.run_initial_load()
+            if success:
+                # Update state
+                state = {
+                    "last_run": datetime.now().isoformat(),
+                    "first_run": False
+                }
+                self.save_state(state)
+        else:
+            # Subsequent runs - incremental updates
+            success = self.run_incremental_update()
+            if success:
+                # Update last run time
+                state["last_run"] = datetime.now().isoformat()
+                self.save_state(state)
         
-        # Prepare data rows
-        rows = self.prepare_data(weather_data)
-        if not rows:
-            logger.error("❌ No data to upload")
-            return False
-        
-        # Upload to Google Sheets
-        if not self.upload_to_sheets(rows):
-            return False
-        
-        logger.info("🎉 ETL process completed successfully!")
-        return True
+        if success:
+            logger.info("🎉 ETL process completed successfully!")
+        else:
+            logger.error("❌ ETL process failed")
+            
+        return success
 
 def main():
     """Main execution function"""
-    # Configuration - can be moved to config file or environment variables
+    # Configuration
     config = {
         'service_account_file': os.getenv('SERVICE_ACCOUNT_FILE', 'service_account.json'),
         'sheet_name': os.getenv('SHEET_NAME', 'Weather_Data'),
