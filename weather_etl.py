@@ -96,8 +96,6 @@ class WeatherETL:
     
     def fetch_weather_data(self, start_date=None, end_date=None, forecast_days=1):
         """Fetch weather data from Open-Meteo API"""
-        API_URL = "https://api.open-meteo.com/v1/forecast"
-        
         params = {
             "latitude": self.LAT,
             "longitude": self.LON,
@@ -109,7 +107,7 @@ class WeatherETL:
         # For historical data (past week on first run)
         if start_date and end_date:
             # Use historical weather API for past data
-            API_URL = "https://archive-api.open-meteo.com/v1/era5"
+            API_URL = "https://archive-api.open-meteo.com/v1/archive"
             params.update({
                 "start_date": start_date,
                 "end_date": end_date
@@ -117,6 +115,7 @@ class WeatherETL:
             logger.info(f"📅 Fetching historical data from {start_date} to {end_date}")
         else:
             # For current/forecast data
+            API_URL = "https://api.open-meteo.com/v1/forecast"
             params["forecast_days"] = forecast_days
             logger.info(f"🔮 Fetching forecast data for {forecast_days} days")
         
@@ -126,7 +125,14 @@ class WeatherETL:
                 response = requests.get(API_URL, params=params, timeout=30)
                 response.raise_for_status()
                 data = response.json()
+                
+                # Validate response has required data
+                if "hourly" not in data or not data["hourly"].get("time"):
+                    logger.warning(f"⚠️ Invalid response structure: {data}")
+                    raise ValueError("Invalid API response structure")
+                
                 logger.info("🌍 Weather data fetched successfully")
+                logger.debug(f"📊 Received {len(data['hourly']['time'])} hourly records")
                 return data
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Attempt {attempt + 1} failed: {e}")
@@ -135,9 +141,12 @@ class WeatherETL:
                 else:
                     logger.error(f"❌ Failed to fetch weather data after {max_retries} attempts")
                     return None
+            except ValueError as e:
+                logger.error(f"❌ Data validation error: {e}")
+                return None
     
     def prepare_data(self, data, existing_timestamps=None):
-        """Transform weather data into list of rows, filtering duplicates"""
+        """Transform weather data into list of rows, filtering duplicates and incomplete data"""
         try:
             hourly = data["hourly"]
             
@@ -158,12 +167,11 @@ class WeatherETL:
             fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             existing_timestamps = existing_timestamps or set()
             
-            # Get the minimum length to avoid index errors
-            min_length = min(len(arr) for arr in [times, temperatures, humidity, 
-                           visibility, weather_codes, precipitation] if arr)
-            
+            # Use times length as primary reference
             duplicate_count = 0
-            for i in range(min_length):
+            incomplete_count = 0
+            
+            for i in range(len(times)):
                 timestamp = times[i] if i < len(times) else ''
                 
                 # Skip if this timestamp already exists
@@ -171,18 +179,36 @@ class WeatherETL:
                     duplicate_count += 1
                     continue
                 
+                # Get values with safe indexing
+                temp = temperatures[i] if i < len(temperatures) else None
+                humid = humidity[i] if i < len(humidity) else None
+                vis = visibility[i] if i < len(visibility) else None
+                weather = weather_codes[i] if i < len(weather_codes) else None
+                precip = precipitation[i] if i < len(precipitation) else None
+                
+                # Skip rows with critical missing data (temperature and humidity)
+                if temp is None or humid is None:
+                    incomplete_count += 1
+                    logger.warning(f"⚠️ Skipping incomplete data for {timestamp}")
+                    continue
+                
+                # Handle missing optional fields with defaults
+                vis = vis if vis is not None else 24000  # Default visibility in meters
+                weather = weather if weather is not None else 0  # Clear sky default
+                precip = precip if precip is not None else 0  # No precipitation default
+                
                 row = [
                     timestamp,
-                    temperatures[i] if i < len(temperatures) else '',
-                    humidity[i] if i < len(humidity) else '',
-                    visibility[i] if i < len(visibility) else '',
-                    weather_codes[i] if i < len(weather_codes) else '',
-                    precipitation[i] if i < len(precipitation) else '',
+                    temp,
+                    humid,
+                    vis,
+                    weather,
+                    precip,
                     fetched_at
                 ]
                 rows.append(row)
             
-            logger.info(f"📊 Prepared {len(rows)} new rows ({duplicate_count} duplicates skipped)")
+            logger.info(f"📊 Prepared {len(rows)} new rows ({duplicate_count} duplicates, {incomplete_count} incomplete records skipped)")
             return rows
         except Exception as e:
             logger.error(f"❌ Error preparing data: {e}")
@@ -230,9 +256,12 @@ class WeatherETL:
         """Run initial load with past week's data"""
         logger.info("🔄 Running initial load - fetching past week's data...")
         
-        # Calculate date range for past week
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=7)
+        # Calculate date range for past week (excluding today to avoid incomplete data)
+        today = datetime.now().date()
+        end_date = today - timedelta(days=1)  # Yesterday
+        start_date = end_date - timedelta(days=6)  # 7 days total
+        
+        logger.info(f"📅 Loading data from {start_date} to {end_date}")
         
         # Fetch historical data
         weather_data = self.fetch_weather_data(
