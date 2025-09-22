@@ -27,7 +27,7 @@ except Exception as e:
     exit(1)
 
 # Open Google Sheet
-SHEET_NAME = "Weather_Test_Data"
+SHEET_NAME = "Weather_Data"
 try:
     sheet = client.open(SHEET_NAME).sheet1
     print(f"✓ Successfully opened Google Sheet: {SHEET_NAME}")
