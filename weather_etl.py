@@ -1,5 +1,6 @@
-# weather_etl.py
 import os
+import base64
+import json
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -12,11 +13,9 @@ print("🚀 Starting Weather ETL process...")
 # ----------------------------
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-if not os.path.exists("service_account.json"):
-    print("❌ Error: service_account.json file not found!")
-    exit(1)
-
-creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+# Decode the service account JSON from GitHub Secrets
+service_account_info = json.loads(base64.b64decode(os.getenv("SERVICE_ACCOUNT_B64")).decode("utf-8"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
 client = gspread.authorize(creds)
 print("✅ Connected to Google Sheets")
 
@@ -28,54 +27,39 @@ except Exception as e:
     exit(1)
 
 # ----------------------------
-# 2. OpenWeather Setup
+# 2. Open-Meteo Setup
 # ----------------------------
-API_KEY = os.getenv("OPENWEATHER_API_KEY")
-if not API_KEY:
-    print("❌ OPENWEATHER_API_KEY not found in environment variables")
-    exit(1)
-
-LAT = 28.61    # Example: Delhi latitude
-LON = 77.23    # Example: Delhi longitude
-EXCLUDE = "minutely,daily,alerts,current"
+LAT = float(os.getenv("LAT", "28.61"))
+LON = float(os.getenv("LON", "77.23"))
+API_URL = "https://api.open-meteo.com/v1/forecast"
+EXCLUDE = "current,minutely,daily,alerts"
 UNITS = "metric"
-
-API_URL = f"https://api.openweathermap.org/data/2.5/onecall"
+TIMEZONE = "Asia/Kolkata"
 
 # ----------------------------
 # 3. Helper Functions
 # ----------------------------
-def fetch_hourly_weather(dt=None):
-    """
-    Fetch hourly weather. If dt is None, fetch current forecast (48h).
-    If dt is timestamp, fetch historical hourly data for that day.
-    """
+def fetch_hourly_weather():
     params = {
-        "lat": LAT,
-        "lon": LON,
-        "appid": API_KEY,
-        "units": UNITS,
-        "exclude": EXCLUDE
+        "latitude": LAT,
+        "longitude": LON,
+        "hourly": "temperature_2m,humidity_2m,visibility,weathercode",
+        "timezone": TIMEZONE,
+        "exclude": EXCLUDE,
+        "units": UNITS
     }
-    if dt:
-        # Historical API endpoint
-        url = f"https://api.openweathermap.org/data/2.5/onecall/timemachine"
-        params["dt"] = dt
-    else:
-        url = API_URL
-
-    response = requests.get(url, params=params, timeout=30)
+    response = requests.get(API_URL, params=params, timeout=30)
     response.raise_for_status()
     return response.json().get("hourly", [])
 
 def format_row(hour_data):
-    dt_iso = datetime.utcfromtimestamp(hour_data["dt"]).strftime("%Y-%m-%dT%H:%M")
+    dt_iso = datetime.utcfromtimestamp(hour_data["timestamp"]).strftime("%Y-%m-%dT%H:%M")
     return [
         dt_iso,
-        hour_data.get("temp", ""),
-        hour_data.get("humidity", ""),
+        hour_data.get("temperature_2m", ""),
+        hour_data.get("humidity_2m", ""),
         hour_data.get("visibility", ""),
-        hour_data.get("weather")[0]["id"] if "weather" in hour_data else "",
+        hour_data.get("weathercode", ""),
         datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     ]
 
@@ -94,7 +78,7 @@ if not existing_times:
     for days_ago in range(5, 0, -1):
         dt = int((datetime.utcnow() - timedelta(days=days_ago)).timestamp())
         try:
-            hourly_data = fetch_hourly_weather(dt)
+            hourly_data = fetch_hourly_weather()
             for h in hourly_data:
                 row = format_row(h)
                 if row[0] not in existing_times:
