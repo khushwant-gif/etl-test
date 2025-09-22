@@ -2,35 +2,68 @@ name: Weather ETL
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Run every 12 hours
+    - cron: '0 */12 * * *'  # Run every 12 hours (fixed syntax)
   workflow_dispatch:  # Allow manual trigger
+  push:
+    branches: [ main ]  # Optional: run on push to main for testing
 
 jobs:
   weather_etl:
     runs-on: ubuntu-latest
-
+    
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
-
+      uses: actions/checkout@v4  # Updated to latest version
+      
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10'
-
+        python-version: '3.11'  # Updated to newer stable version
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements-minimal.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install requests gspread oauth2client
-
+        
     - name: Decode service account JSON
       run: |
         echo "${{ secrets.SERVICE_ACCOUNT_B64 }}" | base64 --decode > service_account.json
-
+      env:
+        SERVICE_ACCOUNT_B64: ${{ secrets.SERVICE_ACCOUNT_B64 }}
+        
+    - name: Verify service account file
+      run: |
+        if [ ! -f "service_account.json" ]; then
+          echo "❌ Service account file not found"
+          exit 1
+        fi
+        echo "✅ Service account file created successfully"
+        
     - name: Run weather ETL script
       run: |
         python weather_etl.py
       env:
-        SERVICE_ACCOUNT_B64: ${{ secrets.SERVICE_ACCOUNT_B64 }}
-        LAT: ${{ secrets.LAT }}
-        LON: ${{ secrets.LON }}
+        LATITUDE: ${{ secrets.LAT || '28.61' }}  # Default to Delhi if not set
+        LONGITUDE: ${{ secrets.LON || '77.23' }}  # Default to Delhi if not set
+        SHEET_NAME: ${{ secrets.SHEET_NAME || 'Weather_Data' }}
+        
+    - name: Clean up sensitive files
+      if: always()
+      run: |
+        rm -f service_account.json
+        
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: etl-logs
+        path: weather_etl.log
+        retention-days: 7
