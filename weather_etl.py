@@ -1,8 +1,9 @@
+# weather_etl.py
 import os
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 print("🚀 Starting Weather ETL process...")
 
@@ -12,84 +13,121 @@ print("🚀 Starting Weather ETL process...")
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
 if not os.path.exists("service_account.json"):
-    print("❌ service_account.json not found")
+    print("❌ Error: service_account.json file not found!")
     exit(1)
 
+creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+client = gspread.authorize(creds)
+print("✅ Connected to Google Sheets")
+
+sheet_name = "WeatherData"
 try:
-    creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open("Weather_Data").sheet1
-    print("✅ Connected to Google Sheets")
+    sheet = client.open(sheet_name).sheet1
 except Exception as e:
-    print(f"❌ Error connecting to Google Sheets: {e}")
+    print(f"❌ Error opening Google Sheet: {e}")
     exit(1)
 
 # ----------------------------
-# 2. OpenWeather API Setup
+# 2. OpenWeather Setup
 # ----------------------------
-API_KEY = os.getenv("OPENWEATHER_API_KEY")  # <-- GitHub Secret
-
+API_KEY = os.getenv("OPENWEATHER_API_KEY")
 if not API_KEY:
     print("❌ OPENWEATHER_API_KEY not found in environment variables")
     exit(1)
 
-LAT, LON = 28.61, 77.23  # Example: Delhi, change to your location
+LAT = 28.61    # Example: Delhi latitude
+LON = 77.23    # Example: Delhi longitude
+EXCLUDE = "minutely,daily,alerts,current"
+UNITS = "metric"
 
-API_URL = (
-    f"https://api.openweathermap.org/data/2.5/onecall"
-    f"?lat={LAT}&lon={LON}&exclude=minutely,daily,alerts,current"
-    f"&appid={API_KEY}&units=metric"
-)
+API_URL = f"https://api.openweathermap.org/data/2.5/onecall"
 
-print("🌍 Fetching weather data...")
-try:
-    response = requests.get(API_URL, timeout=30)
+# ----------------------------
+# 3. Helper Functions
+# ----------------------------
+def fetch_hourly_weather(dt=None):
+    """
+    Fetch hourly weather. If dt is None, fetch current forecast (48h).
+    If dt is timestamp, fetch historical hourly data for that day.
+    """
+    params = {
+        "lat": LAT,
+        "lon": LON,
+        "appid": API_KEY,
+        "units": UNITS,
+        "exclude": EXCLUDE
+    }
+    if dt:
+        # Historical API endpoint
+        url = f"https://api.openweathermap.org/data/2.5/onecall/timemachine"
+        params["dt"] = dt
+    else:
+        url = API_URL
+
+    response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
-    data = response.json()
-    print("✅ Weather data fetched")
+    return response.json().get("hourly", [])
+
+def format_row(hour_data):
+    dt_iso = datetime.utcfromtimestamp(hour_data["dt"]).strftime("%Y-%m-%dT%H:%M")
+    return [
+        dt_iso,
+        hour_data.get("temp", ""),
+        hour_data.get("humidity", ""),
+        hour_data.get("visibility", ""),
+        hour_data.get("weather")[0]["id"] if "weather" in hour_data else "",
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ]
+
+# ----------------------------
+# 4. Fetch Existing Times
+# ----------------------------
+existing_times = set(sheet.col_values(1)[1:])  # skip header
+
+# ----------------------------
+# 5. Backfill if Empty
+# ----------------------------
+rows_to_add = []
+
+if not existing_times:
+    print("⏳ Sheet empty. Performing 5-day historical backfill...")
+    for days_ago in range(5, 0, -1):
+        dt = int((datetime.utcnow() - timedelta(days=days_ago)).timestamp())
+        try:
+            hourly_data = fetch_hourly_weather(dt)
+            for h in hourly_data:
+                row = format_row(h)
+                if row[0] not in existing_times:
+                    rows_to_add.append(row)
+            print(f"   ✓ Fetched {len(hourly_data)} hours for {days_ago} days ago")
+        except Exception as e:
+            print(f"❌ Error fetching historical data: {e}")
+
+# ----------------------------
+# 6. Fetch Next 12 Hours Forecast
+# ----------------------------
+print("🌍 Fetching next 12 hours forecast...")
+try:
+    forecast_data = fetch_hourly_weather()
+    for h in forecast_data[:12]:  # only next 12 hours
+        row = format_row(h)
+        if row[0] not in existing_times:
+            rows_to_add.append(row)
+    print(f"   ✓ Prepared {len(rows_to_add)} new rows for upload")
 except Exception as e:
     print(f"❌ Error fetching weather data: {e}")
     exit(1)
 
 # ----------------------------
-# 3. Prepare Data
-# ----------------------------
-headers = ["Time", "Temperature_2m", "Humidity_2m", "Visibility", "WeatherCode", "Fetched_At"]
-
-# Add headers if sheet is empty
-if len(sheet.get_all_values()) == 0:
-    sheet.append_row(headers)
-    print("📝 Added headers to sheet")
-
-# Collect already present times
-existing_times = [row[0] for row in sheet.get_all_values()[1:]]  # skip header
-
-rows_to_add = []
-for hourly in data.get("hourly", [])[:12]:  # next 12 hours
-    time_str = datetime.utcfromtimestamp(hourly["dt"]).strftime("%Y-%m-%dT%H:%M")
-    if time_str not in existing_times:
-        row = [
-            time_str,
-            hourly.get("temp", ""),
-            hourly.get("humidity", ""),
-            hourly.get("visibility", ""),
-            hourly["weather"][0]["id"] if "weather" in hourly else "",
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        ]
-        rows_to_add.append(row)
-
-print(f"📊 Prepared {len(rows_to_add)} new rows")
-
-# ----------------------------
-# 4. Upload Data
+# 7. Upload to Google Sheets
 # ----------------------------
 if rows_to_add:
-    try:
-        sheet.append_rows(rows_to_add)
-        print(f"✅ Added {len(rows_to_add)} new rows to Google Sheets")
-    except Exception as e:
-        print(f"❌ Error uploading to Google Sheets: {e}")
+    # Add headers if sheet is empty
+    if sheet.row_count == 0 or len(sheet.row_values(1)) == 0:
+        sheet.append_row(["Time", "Temperature", "Humidity", "Visibility", "WeatherCode", "Fetched_At"])
+    sheet.append_rows(rows_to_add)
+    print(f"✅ Successfully appended {len(rows_to_add)} rows to Google Sheets!")
 else:
-    print("⏩ No new rows to add (all data already exists)")
+    print("⚠️ No new rows to add")
 
-print("🎉 Weather ETL completed successfully")
+print("🎉 ETL process completed successfully!")
