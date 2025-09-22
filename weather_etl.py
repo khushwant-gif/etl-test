@@ -2,7 +2,6 @@ import os
 import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import pandas as pd
 from datetime import datetime
 import logging
 import time
@@ -74,52 +73,74 @@ class WeatherETL:
                     logger.error(f"❌ Failed to fetch weather data after {max_retries} attempts")
                     return None
     
-    def prepare_dataframe(self, data):
-        """Transform weather data into DataFrame"""
+    def prepare_data(self, data):
+        """Transform weather data into list of rows"""
         try:
             hourly = data["hourly"]
             
-            # Create DataFrame with error handling for missing data
-            df_data = {
-                "Time": hourly.get("time", []),
-                "Temperature_2m": hourly.get("temperature_2m", []),
-                "Humidity_2m": hourly.get("relative_humidity_2m", []),
-                "Visibility": hourly.get("visibility", []),
-                "WeatherCode": hourly.get("weathercode", []),
-                "Precipitation": hourly.get("precipitation", []),
-                "Fetched_At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+            # Get data arrays
+            times = hourly.get("time", [])
+            temperatures = hourly.get("temperature_2m", [])
+            humidity = hourly.get("relative_humidity_2m", [])
+            visibility = hourly.get("visibility", [])
+            weather_codes = hourly.get("weathercode", [])
+            precipitation = hourly.get("precipitation", [])
             
-            df = pd.DataFrame(df_data)
+            # Check if we have data
+            if not times:
+                raise ValueError("No time data received from API")
             
-            # Data quality checks
-            if df.empty:
-                raise ValueError("No data received from API")
+            # Prepare rows
+            rows = []
+            fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            # Remove any rows with all NaN values (except Fetched_At)
-            df = df.dropna(subset=['Time', 'Temperature_2m'], how='all')
+            # Get the minimum length to avoid index errors
+            min_length = min(len(arr) for arr in [times, temperatures, humidity, 
+                           visibility, weather_codes, precipitation] if arr)
             
-            logger.info(f"📊 Prepared DataFrame with {len(df)} rows")
-            return df
+            for i in range(min_length):
+                row = [
+                    times[i] if i < len(times) else '',
+                    temperatures[i] if i < len(temperatures) else '',
+                    humidity[i] if i < len(humidity) else '',
+                    visibility[i] if i < len(visibility) else '',
+                    weather_codes[i] if i < len(weather_codes) else '',
+                    precipitation[i] if i < len(precipitation) else '',
+                    fetched_at
+                ]
+                rows.append(row)
+            
+            logger.info(f"📊 Prepared {len(rows)} rows of data")
+            return rows
         except Exception as e:
-            logger.error(f"❌ Error preparing DataFrame: {e}")
+            logger.error(f"❌ Error preparing data: {e}")
             return None
     
-    def upload_to_sheets(self, df):
-        """Upload DataFrame to Google Sheets"""
+    def upload_to_sheets(self, rows):
+        """Upload data rows to Google Sheets"""
         try:
+            # Define headers
+            headers = [
+                "Time", "Temperature_2m", "Humidity_2m", 
+                "Visibility", "WeatherCode", "Precipitation", "Fetched_At"
+            ]
+            
             # Check if sheet is empty and add headers
             if self.sheet.row_count == 0 or len(self.sheet.row_values(1)) == 0:
-                self.sheet.append_row(list(df.columns))
+                self.sheet.append_row(headers)
                 logger.info("📋 Added headers to sheet")
             
-            # Convert DataFrame to list of lists, handling NaN values
-            data_to_upload = df.fillna('').values.tolist()
+            # Upload data in batches for better performance
+            batch_size = 100
+            total_uploaded = 0
             
-            # Batch upload for better performance
-            self.sheet.append_rows(data_to_upload)
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                self.sheet.append_rows(batch)
+                total_uploaded += len(batch)
+                logger.info(f"📤 Uploaded batch: {len(batch)} rows")
             
-            logger.info(f"✅ Successfully uploaded {len(df)} rows to Google Sheets")
+            logger.info(f"✅ Successfully uploaded {total_uploaded} rows to Google Sheets")
             return True
         except Exception as e:
             logger.error(f"❌ Error uploading to Google Sheets: {e}")
@@ -138,14 +159,14 @@ class WeatherETL:
         if not weather_data:
             return False
         
-        # Prepare DataFrame
-        df = self.prepare_dataframe(weather_data)
-        if df is None or df.empty:
+        # Prepare data rows
+        rows = self.prepare_data(weather_data)
+        if not rows:
             logger.error("❌ No data to upload")
             return False
         
         # Upload to Google Sheets
-        if not self.upload_to_sheets(df):
+        if not self.upload_to_sheets(rows):
             return False
         
         logger.info("🎉 ETL process completed successfully!")
@@ -160,6 +181,9 @@ def main():
         'lat': float(os.getenv('LATITUDE', '28.61')),  # Delhi latitude
         'lon': float(os.getenv('LONGITUDE', '77.23'))   # Delhi longitude
     }
+    
+    logger.info(f"🌍 Coordinates: {config['lat']}, {config['lon']}")
+    logger.info(f"📊 Target sheet: {config['sheet_name']}")
     
     # Initialize and run ETL
     etl = WeatherETL(**config)
