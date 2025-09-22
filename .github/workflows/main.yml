@@ -28,5 +28,8 @@ jobs:
           echo "${{ secrets.SERVICE_ACCOUNT_B64 }}" | base64 --decode > service_account.json
           echo "Service account file created successfully"
 
-      - name: Run Weather ETL Script
+      - name: Run ETL Script
         run: python weather_etl.py
+        env: 
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+
