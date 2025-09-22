@@ -1,35 +1,36 @@
-name: Weather ETL to Google Sheets
+name: Weather ETL
 
 on:
   schedule:
-    - cron: '0 0,12 * * *'  # Runs at 00:00 UTC and 12:00 UTC every day
-  workflow_dispatch:        # Manual trigger if needed
+    - cron: '0 */12 * * *'  # Run every 12 hours
+  workflow_dispatch:  # Allow manual trigger
 
 jobs:
-  run-etl:
+  weather_etl:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install gspread oauth2client requests pandas
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests gspread oauth2client
 
-      - name: Set Google Credentials from Base64
-        run: |
-          echo "${{ secrets.SERVICE_ACCOUNT_B64 }}" | base64 --decode > service_account.json
-          echo "Service account file created successfully"
+    - name: Decode service account JSON
+      run: |
+        echo "${{ secrets.SERVICE_ACCOUNT_B64 }}" | base64 --decode > service_account.json
 
-      - name: Run ETL Script
-        run: python weather_etl.py
-        env: 
-          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
-
+    - name: Run weather ETL script
+      run: |
+        python weather_etl.py
+      env:
+        SERVICE_ACCOUNT_B64: ${{ secrets.SERVICE_ACCOUNT_B64 }}
+        LAT: ${{ secrets.LAT }}
+        LON: ${{ secrets.LON }}
